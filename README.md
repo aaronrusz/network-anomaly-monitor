@@ -1,4 +1,4 @@
-# Network Anomaly Detection and AI Agent Protocol Monitor
+# network-anomaly-monitor
 
 This project is a Python-based tool for monitoring network traffic, detecting anomalies, and analyzing AI agent communication patterns. It leverages packet sniffing, statistical analysis, and system metrics to provide insights into unusual activity on a host or network.
 
