@@ -28,10 +28,16 @@ This project is a Python-based tool for monitoring network traffic, detecting an
 
 > ⚠️ **Note:** This program requires elevated privileges (e.g., `sudo` on Linux/Mac or administrator rights on Windows) to capture network traffic.
 
-Run the monitor:
+Run the monitor with stealth mode disabled (default):
 
 ```bash
 sudo python3 network_anomaly_monitor.py
+```
+
+Run the monitor with stealth mode enabled:
+
+```bash
+sudo python3 network_anomaly_monitor.py --stealth
 ```
 
 The script will:
