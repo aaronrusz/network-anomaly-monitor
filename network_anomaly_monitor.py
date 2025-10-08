@@ -17,9 +17,18 @@ import hashlib
 import numpy as np
 from collections import Counter
 import math
+import random
+import mmap
+import os
+import sys
+import signal
+import struct
+import gc
+from pathlib import Path
+import tempfile
 
 try:
-    from scapy.all import sniff, IP, TCP, UDP, DNS, Raw
+    from scapy.all import sniff, IP, TCP, UDP, DNS, Raw, get_if_list, conf
     import psutil
     import requests
     from scipy import stats
@@ -38,10 +47,24 @@ except ImportError as e:
     exit(1)
 
 class NetworkMonitor:
-    def __init__(self, interface=None):
+    def __init__(self, interface=None, stealth_mode=False):
         self.interface = interface
+        self.stealth_mode = stealth_mode
         self.baseline_window = 300  # 5 minutes for baseline
         self.alert_threshold = 2.0  # Standard deviations for anomaly
+
+        # Performance optimizations
+        self.sample_rate = 0.1 if stealth_mode else 1.0  # Sample 10% of packets in stealth mode
+        self.max_memory_flows = 500  # Limit memory usage
+        self.cleanup_interval = 300  # Clean old data every 5 minutes
+
+        # Circular buffer for memory-mapped storage
+        self.buffer_size = 10000
+        self.setup_memory_buffers()
+
+        # Randomized timing for stealth
+        self.base_stats_interval = 60
+        self.jitter_range = 30
 
         # Traffic tracking
         self.traffic_stats = defaultdict(lambda: deque(maxlen=100))
@@ -49,56 +72,60 @@ class NetworkMonitor:
         self.protocol_stats = defaultdict(int)
         self.dns_queries = deque(maxlen=1000)
 
-        # AI/ML protocol signatures
+        # Enhanced AI/ML protocol signatures
         self.ai_protocols = {
-            'openai': ['api.openai.com', 'openai.com'],
+            'openai': ['api.openai.com', 'openai.com', 'chat.openai.com'],
             'anthropic': ['api.anthropic.com', 'claude.ai'],
-            'google_ai': ['generativelanguage.googleapis.com', 'bard.google.com'],
-            'azure_openai': ['openai.azure.com'],
-            'huggingface': ['huggingface.co', 'api-inference.huggingface.co'],
-            'ollama': ['localhost:11434'],  # Default Ollama port
-            'langchain': ['langchain.com', 'api.langchain.com'],
+            'google_ai': ['generativelanguage.googleapis.com', 'bard.google.com', 'ai.google.dev'],
+            'azure_openai': ['openai.azure.com', '*.openai.azure.com'],
+            'huggingface': ['huggingface.co', 'api-inference.huggingface.co', 'inference-api.huggingface.co'],
+            'ollama': ['localhost:11434', '127.0.0.1:11434'],
+            'langchain': ['langchain.com', 'api.langchain.com', 'smith.langchain.com'],
             'replicate': ['replicate.com', 'api.replicate.com'],
-            'cohere': ['api.cohere.ai'],
-            'stability': ['api.stability.ai'],
+            'cohere': ['api.cohere.ai', 'cohere.ai'],
+            'stability': ['api.stability.ai', 'stability.ai'],
+            'mistral': ['api.mistral.ai', 'mistral.ai'],
+            'local_llm': ['localhost:8000', 'localhost:5000', '127.0.0.1:8000']
         }
 
-        # Agent-to-Agent and specialized protocol ports/patterns
+        # Advanced agent protocols with more signatures
         self.agent_protocols = {
             'a2a': {
-                'ports': [8080, 8081, 8082, 9090, 9091, 5000, 5001],  # Common A2A ports
-                'patterns': [r'agent-to-agent', r'a2a-protocol', r'/agents/', r'/communicate'],
-                'content_types': ['application/x-a2a', 'application/agent-message']
+                'ports': [8080, 8081, 8082, 9090, 9091, 5000, 5001, 6000, 6001],
+                'patterns': [r'agent-to-agent', r'a2a-protocol', r'/agents/', r'/communicate',
+                           r'multi-agent', r'agent-mesh', r'coordination'],
+                'content_types': ['application/x-a2a', 'application/agent-message', 'application/json'],
+                'headers': ['X-Agent-ID', 'X-Agent-Type', 'X-Coordination-ID']
             },
             'acp': {
-                'ports': [7000, 7001, 7777, 8888, 9999],  # Common ACP ports
-                'patterns': [r'agent-communication', r'acp-protocol', r'/acp/', r'agent-comm'],
-                'content_types': ['application/x-acp', 'application/agent-comm']
+                'ports': [7000, 7001, 7777, 8888, 9999, 7002, 7003],
+                'patterns': [r'agent-communication', r'acp-protocol', r'/acp/', r'agent-comm',
+                           r'protocol-acp', r'comm-agent'],
+                'content_types': ['application/x-acp', 'application/agent-comm'],
+                'headers': ['X-ACP-Version', 'X-Agent-Protocol', 'X-Communication-Type']
             },
             'mcp': {
-                'ports': [3000, 3001, 3333, 4000, 4001],  # Common MCP ports
-                'patterns': [r'model-context', r'mcp-protocol', r'/mcp/', r'context-protocol'],
-                'content_types': ['application/x-mcp', 'application/model-context']
+                'ports': [3000, 3001, 3333, 4000, 4001, 4444, 4445],
+                'patterns': [r'model-context', r'mcp-protocol', r'/mcp/', r'context-protocol',
+                           r'model-coordination', r'context-sharing'],
+                'content_types': ['application/x-mcp', 'application/model-context'],
+                'headers': ['X-MCP-Version', 'X-Context-ID', 'X-Model-Protocol']
+            },
+            'swarm': {
+                'ports': [9000, 9001, 9002, 9003, 9500, 9501],
+                'patterns': [r'agent-swarm', r'swarm-protocol', r'/swarm/', r'collective-ai',
+                           r'distributed-agent', r'swarm-coordination'],
+                'content_types': ['application/x-swarm', 'application/swarm-protocol'],
+                'headers': ['X-Swarm-ID', 'X-Swarm-Node', 'X-Collective-ID']
             }
         }
 
-        # Common AI agent user agents and headers
+        # Enhanced AI agent patterns
         self.ai_agent_patterns = [
-            r'langchain',
-            r'openai-python',
-            r'anthropic-sdk',
-            r'ollama',
-            r'autogen',
-            r'crewai',
-            r'agent',
-            r'llm',
-            r'chatbot',
-            r'a2a-agent',
-            r'acp-client',
-            r'mcp-client',
-            r'agent-framework',
-            r'multi-agent',
-            r'swarm',
+            r'langchain', r'openai-python', r'anthropic-sdk', r'ollama', r'autogen',
+            r'crewai', r'agent', r'llm', r'chatbot', r'a2a-agent', r'acp-client',
+            r'mcp-client', r'agent-framework', r'multi-agent', r'swarm', r'aiagent',
+            r'autonomous-agent', r'ai-coordinator', r'agent-executor'
         ]
 
         # Protocol-specific tracking
@@ -120,17 +147,154 @@ class NetworkMonitor:
 
         self.alerts = []
         self.running = False
+        self.last_cleanup = time.time()
+        self.packet_count = 0
+        self.temp_dir = tempfile.mkdtemp(prefix='.netmon_')
+
 
         # Setup logging
+        self.setup_logging()
+        
+        # Signal handlers for cleanup
+        signal.signal(signal.SIGINT, self.signal_handler)
+        signal.signal(signal.SIGTERM, self.signal_handler)
+
+    def setup_memory_buffers(self):
+        """Setup memory-mapped circular buffers for efficient data storage"""
+        try:
+            # Create temporary file for memory mapping
+            self.buffer_file = tempfile.NamedTemporaryFile(delete=False, prefix='.netbuf_')
+
+            # Initialize buffer with zeros
+            buffer_data = b'\x00' * (self.buffer_size * 256)  # 256 bytes per entry
+            self.buffer_file.write(buffer_data)
+            self.buffer_file.flush()
+
+            # Memory map the file
+            self.buffer_map = mmap.mmap(self.buffer_file.fileno(), 0)
+            self.buffer_index = 0
+
+        except Exception as e:
+            print(f"Warning: Could not setup memory buffers: {e}")
+            self.buffer_map = None
+
+    def setup_logging(self):
+        """Setup logging"""
+        log_file = 'network_monitor.log'
+        log_level = logging.INFO
+
         logging.basicConfig(
-            level=logging.INFO,
+            level=log_level,
             format='%(asctime)s - %(levelname)s - %(message)s',
             handlers=[
-                logging.FileHandler('network_monitor.log'),
+                logging.FileHandler(log_file),
                 logging.StreamHandler()
             ]
         )
         self.logger = logging.getLogger(__name__)
+
+    def write_to_buffer(self, data):
+        """Write data to memory-mapped circular buffer"""
+        if not self.buffer_map:
+            return
+
+        try:
+            # Convert data to bytes and pad/truncate to 256 bytes
+            if isinstance(data, str):
+                data_bytes = data.encode('utf-8', errors='ignore')
+            else:
+                data_bytes = str(data).encode('utf-8', errors='ignore')
+
+            data_bytes = data_bytes[:255]  # Leave one byte for null terminator
+            data_bytes = data_bytes.ljust(256, b'\x00')
+
+            # Write to current buffer position
+            start_pos = (self.buffer_index % self.buffer_size) * 256
+            self.buffer_map[start_pos:start_pos + 256] = data_bytes
+            self.buffer_index += 1
+
+        except Exception:
+            pass  # Silently fail in stealth mode
+
+    def generate_decoy_traffic(self):
+        """Generate decoy network traffic to mask monitoring activities"""
+        if not self.stealth_mode:
+            return
+
+        try:
+            # Random HTTP requests to common sites (non-suspicious)
+            decoy_sites = [
+                'httpbin.org/get', 'jsonplaceholder.typicode.com/posts/1',
+                'api.github.com/zen', 'httpstat.us/200'
+            ]
+
+            if random.random() < 0.1:  # 10% chance every call
+                site = random.choice(decoy_sites)
+                threading.Thread(target=self._make_decoy_request, args=(site,), daemon=True).start()
+
+        except Exception:
+            pass  # Silently fail
+
+    def _make_decoy_request(self, url):
+        """Make a decoy HTTP request"""
+        try:
+            requests.get(f'http://{url}', timeout=5)
+        except:
+            pass
+
+    def should_process_packet(self):
+        """Determine if packet should be processed (sampling)"""
+        self.packet_count += 1
+
+        if self.stealth_mode:
+            # Adaptive sampling based on load
+            if self.packet_count % 1000 == 0:
+                # Adjust sample rate based on memory usage
+                process = psutil.Process()
+                memory_percent = process.memory_percent()
+                if memory_percent > 50:
+                    self.sample_rate = max(0.05, self.sample_rate * 0.8)
+                elif memory_percent < 20:
+                    self.sample_rate = min(0.2, self.sample_rate * 1.1)
+
+            return random.random() < self.sample_rate
+
+        return True
+
+    def cleanup_old_data(self):
+        """Periodically clean up old data to manage memory"""
+        current_time = time.time()
+
+        if current_time - self.last_cleanup < self.cleanup_interval:
+            return
+
+        self.last_cleanup = current_time
+        cutoff_time = datetime.now() - timedelta(seconds=self.baseline_window * 2)
+
+        try:
+            # Clean up old encrypted flows
+            flows_to_remove = []
+            for flow_key, flow_data in self.encrypted_flows.items():
+                if 'packets' in flow_data and flow_data['packets']:
+                    if flow_data['packets'][-1] < cutoff_time:
+                        flows_to_remove.append(flow_key)
+
+            for flow_key in flows_to_remove[:len(flows_to_remove)//2]:  # Remove half of old flows
+                del self.encrypted_flows[flow_key]
+
+            # Clean up agent connections
+            for protocol in self.agent_connections:
+                self.agent_connections[protocol] = [
+                    conn for conn in self.agent_connections[protocol]
+                    if (datetime.now() - conn['timestamp']).total_seconds() < 600
+                ]
+
+            # Force garbage collection
+            if self.stealth_mode:
+                gc.collect()
+
+        except Exception as e:
+            self.logger.error(f"Cleanup error: {e}")
 
     def detect_agent_protocols(self, packet):
         """Detect A2A, ACP, and MCP protocol traffic"""
@@ -171,13 +335,14 @@ class NetworkMonitor:
             recent_connections = []
             for protocol_connections in self.agent_connections.values():
                 recent_connections.extend([
-                    conn for conn in protocol_connections 
+                    conn for conn in protocol_connections
                     if (current_time - conn['timestamp']).total_seconds() < 60
                 ])
 
             if len(recent_connections) > 20:  # More than 20 agent connections in last minute
                 alerts.append(f"Potential Agent Swarm Activity: {len(recent_connections)} connections in last minute")
                 self.suspicious_patterns['swarm_activity'] += 1
+        return alerts
 
     def detect_ai_traffic(self, packet):
         """Detect potential AI/ML API traffic"""
@@ -269,6 +434,7 @@ class NetworkMonitor:
             except (UnicodeDecodeError, AttributeError):
                 # Skip packets we can't decode
                 pass
+        return alerts
 
     def calculate_entropy(self, data):
         """Calculate Shannon entropy of data to detect encryption patterns"""
@@ -341,7 +507,7 @@ class NetworkMonitor:
             # Check for size patterns typical of AI/agent protocols
             # Small control messages followed by larger data
             recent_sizes = flow['sizes'][-10:]
-            small_then_large = sum(1 for i in range(len(recent_sizes)-1) 
+            small_then_large = sum(1 for i in range(len(recent_sizes)-1)
                                  if recent_sizes[i] < 100 and recent_sizes[i+1] > 1000)
 
             if small_then_large > 3:  # Multiple small->large patterns
@@ -510,7 +676,7 @@ class NetworkMonitor:
             if timing_alert:
                 alerts.append(timing_alert)
 
-            # Analyze packet size patterns  
+            # Analyze packet size patterns
             size_alert = self.analyze_packet_sizes(flow_key, packet_size)
             if size_alert:
                 alerts.append(size_alert)
@@ -539,48 +705,6 @@ class NetworkMonitor:
                 if session_duration > 1800:  # More than 30 minutes
                     alerts.append(f"Long-lived encrypted session: {session_duration/60:.1f} minutes to {dst_ip}:{dst_port}")
                     self.encryption_patterns['persistent_encrypted'] += 1
-
-        return alerts
-        """Detect potential AI/ML API traffic"""
-        alerts = []
-
-        if packet.haslayer(IP):
-            # Check DNS queries for AI services
-            if packet.haslayer(DNS) and packet[DNS].qr == 0:  # DNS query
-                query = packet[DNS].qd.qname.decode('utf-8').rstrip('.')
-                self.dns_queries.append({
-                    'timestamp': datetime.now(),
-                    'query': query,
-                    'src_ip': packet[IP].src
-                })
-
-                # Check if DNS query matches AI service domains
-                for service, domains in self.ai_protocols.items():
-                    for domain in domains:
-                        if domain in query:
-                            alerts.append(f"AI Service DNS Query: {service} - {query} from {packet[IP].src}")
-
-            # Check HTTP/HTTPS traffic patterns
-            if packet.haslayer(TCP):
-                src_ip = packet[IP].src
-                dst_ip = packet[IP].dst
-                dst_port = packet[TCP].dport
-
-                # Common AI API ports (including agent protocol ports)
-                ai_ports = [80, 443, 8080, 11434]  # Standard ports
-                agent_ports = []
-                for config in self.agent_protocols.values():
-                    agent_ports.extend(config['ports'])
-                all_monitored_ports = ai_ports + agent_ports
-
-                if dst_port in all_monitored_ports:
-                    # Track connection patterns
-                    conn_key = f"{src_ip}:{dst_ip}:{dst_port}"
-                    self.connection_counts[conn_key] += 1
-
-                    # High frequency connections might indicate AI agents
-                    if self.connection_counts[conn_key] > 50:  # Threshold
-                        alerts.append(f"High frequency AI-like traffic: {conn_key} ({self.connection_counts[conn_key]} connections)")
 
         return alerts
 
@@ -621,6 +745,17 @@ class NetworkMonitor:
     def packet_handler(self, packet):
         """Main packet processing function"""
         try:
+            # Sampling for performance
+            if not self.should_process_packet():
+                return
+
+            # Generate decoy traffic occasionally
+            if self.stealth_mode and random.random() < 0.001:  # 0.1% chance
+                self.generate_decoy_traffic()
+
+            # Periodic cleanup
+            self.cleanup_old_data()
+
             # Detect AI traffic
             ai_alerts = self.detect_ai_traffic(packet)
 
@@ -640,11 +775,18 @@ class NetworkMonitor:
             all_alerts = ai_alerts + agent_alerts + signature_alerts + encrypted_alerts + pattern_alerts
             for alert in all_alerts:
                 self.logger.warning(f"ALERT: {alert}")
-                self.alerts.append({
+                alert_data = {
                     'timestamp': datetime.now().isoformat(),
                     'alert': alert,
-                    'packet_info': str(packet.summary())
-                })
+                    'summary': packet.summary()
+                }
+                self.alerts.append(alert_data)
+                self.write_to_buffer(json.dumps(alert_data))
+
+                # Limit alert storage in stealth mode
+                if self.stealth_mode and len(self.alerts) > 1000:
+                    self.alerts = self.alerts[-500:]  # Keep latest 500
+
 
         except Exception as e:
             self.logger.error(f"Error processing packet: {e}")
@@ -699,7 +841,7 @@ class NetworkMonitor:
 
         # Show top encrypted flows by activity
         if self.encrypted_flows:
-            flow_activity = [(flow_key, len(flow_data['packets'])) 
+            flow_activity = [(flow_key, len(flow_data['packets']))
                            for flow_key, flow_data in self.encrypted_flows.items()]
             top_flows = sorted(flow_activity, key=lambda x: x[1], reverse=True)[:5]
 
@@ -761,15 +903,11 @@ class NetworkMonitor:
                 stop_filter=lambda x: not self.running
             )
         except KeyboardInterrupt:
-            print("\n\nStopping monitoring...")
-            self.running = False
-            self.print_statistics()
+            self.stop_monitoring()
+        except Exception as e:
+            self.logger.error(f"Monitoring error: {e}")
+            self.stop_monitoring()
 
-            # Save alerts to file
-            if self.alerts:
-                with open('network_alerts.json', 'w') as f:
-                    json.dump(self.alerts, f, indent=2)
-                print(f"\nAlerts saved to network_alerts.json")
 
     def periodic_stats(self):
         """Periodically print statistics"""
@@ -778,7 +916,77 @@ class NetworkMonitor:
             if self.running:
                 self.print_statistics()
 
+    def stop_monitoring(self):
+        """Clean shutdown with data preservation"""
+        if not self.running:
+            return
+
+        print("\n\nStopping monitor...")
+        self.running = False
+
+        try:
+            # Save data
+            if self.alerts:
+                output_file = 'network_alerts.json'
+                with open(output_file, 'w') as f:
+                    json.dump(self.alerts, f, indent=2)
+                print(f"Alerts saved to {output_file}")
+
+            # Final statistics
+            self.print_statistics()
+
+        except Exception as e:
+            self.logger.error(f"Shutdown error: {e}")
+        finally:
+            self.cleanup_resources()
+
+    def cleanup_resources(self):
+        """Clean up system resources"""
+        try:
+            # Close memory map
+            if hasattr(self, 'buffer_map') and self.buffer_map:
+                self.buffer_map.close()
+
+            # Close buffer file
+            if hasattr(self, 'buffer_file') and self.buffer_file:
+                self.buffer_file.close()
+
+            # Clean up temporary files in stealth mode
+            if self.stealth_mode and hasattr(self, 'temp_dir'):
+                import shutil
+                shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+        except Exception:
+            pass
+
+    def signal_handler(self, signum, frame):
+        """Handle system signals for clean shutdown"""
+        self.stop_monitoring()
+
+
 def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Enhanced Stealth Network Monitor for AI Agent Detection",
+        epilog="WARNING: Use only on networks you own or have explicit permission to monitor"
+    )
+
+    parser.add_argument(
+        '-i', '--interface',
+        help='Network interface to monitor (auto-detect if not specified)'
+    )
+
+    parser.add_argument(
+        '--stealth',
+        action='store_true',
+        default=False,
+        help='Enable stealth mode (default: disabled)'
+    )
+
+    args = parser.parse_args()
+
+
     print("Network Anomaly Detection and AI Agent Protocol Monitor")
     print("=" * 55)
 
@@ -794,7 +1002,7 @@ def main():
     except OSError:
         pass  # This is expected on some systems
 
-    monitor = NetworkMonitor()
+    monitor = NetworkMonitor(interface=args.interface, stealth_mode=args.stealth)
     monitor.start_monitoring()
 
 if __name__ == "__main__":
