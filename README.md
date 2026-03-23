@@ -37,7 +37,7 @@ sudo python3 network_anomaly_monitor.py
 Run the monitor with stealth mode enabled:
 
 ```bash
-sudo python3 network_anomaly_monitor.py --stealth
+sudo python main.py
 ```
 
 The script will:
