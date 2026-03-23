@@ -18,7 +18,7 @@ This project is a Python-based tool for monitoring network traffic, detecting an
 * Dependencies:
 
   ```bash
-  pip install scapy psutil requests scipy numpy
+  pipx install scapy psutil requests scipy numpy
   ```
 * Optional:
 
@@ -31,7 +31,7 @@ This project is a Python-based tool for monitoring network traffic, detecting an
 Run the monitor with stealth mode enabled:
 
 ```bash
-sudo python main.py
+sudo python3 main.py
 ```
 
 The script will:
