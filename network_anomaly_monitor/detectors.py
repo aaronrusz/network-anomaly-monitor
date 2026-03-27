@@ -16,7 +16,7 @@ Covered detection categories
 Dependencies
 ------------
     scapy >= 2.4   (scapy.all, optionally scapy.layers.tls)
-    Python >= 3.10 (uses match-free stdlib only; X | Y union type hints)
+    Python >= 3.10
 """
 
 from __future__ import annotations
@@ -24,23 +24,8 @@ from __future__ import annotations
 import re
 import statistics
 from collections import Counter
-from collections import defaultdict as _DefaultDict  # type alias only
+from collections import defaultdict as _DefaultDict
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING
-
-try:
-    from scapy.all import DNS, IP, Raw, TCP, UDP
-    try:
-        from scapy.layers.tls import TLS
-        TLS_AVAILABLE = True
-    except ImportError:
-        TLS_AVAILABLE = False
-        TLS = None  # type: ignore[assignment]
-except ImportError as exc:
-    raise ImportError(
-        f"Required package missing: {exc}\n"
-        "Install with: pip install scapy"
-    ) from exc
 
 from .config import (
     AGENT_PROTOCOLS,
@@ -54,13 +39,54 @@ from .config import (
 from .crypto_utils import calculate_entropy, chi_square_uniformity
 
 # ---------------------------------------------------------------------------
-# Type aliases (for readability — no runtime cost)
+# Type aliases
 # ---------------------------------------------------------------------------
 
-AlertList   = list[str]
-FlowStore   = _DefaultDict  # defaultdict[str, dict]
-CountStore  = _DefaultDict  # defaultdict[str, int]
-ConnStore   = _DefaultDict  # defaultdict[str, list]
+AlertList  = list[str]
+FlowStore  = _DefaultDict
+CountStore = _DefaultDict
+ConnStore  = _DefaultDict
+
+# ---------------------------------------------------------------------------
+# Lazy scapy loader
+# ---------------------------------------------------------------------------
+# scapy is imported on the first packet processed, not at module load time.
+# This means the package imports cleanly even when scapy is not yet installed,
+# and the user gets a clear, actionable error only when capture actually starts.
+
+_scapy_layers: dict = {}
+TLS_AVAILABLE: bool = False
+
+
+def _layers() -> dict:
+    """
+    Return a dict mapping layer-name strings to scapy layer classes.
+    Imports scapy on the very first call; returns the cached dict on all
+    subsequent calls.
+    """
+    global _scapy_layers, TLS_AVAILABLE
+    if _scapy_layers:
+        return _scapy_layers
+
+    try:
+        from scapy.all import DNS, IP, Raw, TCP, UDP
+    except ImportError as exc:
+        raise ImportError(
+            "scapy is required for packet analysis.\n"
+            "Install with: pip install scapy"
+        ) from exc
+
+    _scapy_layers = {"IP": IP, "TCP": TCP, "UDP": UDP, "DNS": DNS, "Raw": Raw}
+
+    try:
+        from scapy.layers.tls import TLS
+        _scapy_layers["TLS"] = TLS
+        TLS_AVAILABLE = True
+    except ImportError:
+        _scapy_layers["TLS"] = None
+        TLS_AVAILABLE = False
+
+    return _scapy_layers
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +107,9 @@ def detect_ai_traffic(
 
     Returns a list of alert strings (empty if nothing detected).
     """
+    _L = _layers()
+    IP, TCP, DNS = _L["IP"], _L["TCP"], _L["DNS"]
+
     alerts: AlertList = []
 
     if not packet.haslayer(IP):
@@ -144,6 +173,9 @@ def detect_agent_protocols(
 
     Returns a list of alert strings.
     """
+    _L = _layers()
+    IP, TCP = _L["IP"], _L["TCP"]
+
     alerts: AlertList = []
 
     if not (packet.haslayer(IP) and packet.haslayer(TCP)):
@@ -216,6 +248,9 @@ def detect_protocol_signatures(
 
     Returns a list of alert strings.
     """
+    _L = _layers()
+    IP, TCP = _L["IP"], _L["TCP"]
+
     alerts: AlertList = []
 
     if not (packet.haslayer(TCP) and hasattr(packet[TCP], "payload")):
@@ -277,7 +312,6 @@ def analyze_packet_timing(
     flow = encrypted_flows[flow_key]
     flow["timing"].append(timestamp)
 
-    # Cap history to the most recent 100 entries
     if len(flow["timing"]) > 100:
         flow["timing"] = flow["timing"][-100:]
 
@@ -289,7 +323,6 @@ def analyze_packet_timing(
         if len(intervals) >= 10:
             mean_interval = statistics.mean(intervals)
             std_interval  = statistics.stdev(intervals) if len(intervals) > 1 else 0.0
-            # Very regular AND within a sensible heartbeat range
             if std_interval < mean_interval * 0.1 and 0.1 <= mean_interval <= 60:
                 return (
                     f"Regular encrypted communication pattern detected: "
@@ -318,7 +351,6 @@ def analyze_packet_sizes(
     flow = encrypted_flows[flow_key]
     flow["sizes"].append(size)
 
-    # Cap history to the most recent 200 entries
     if len(flow["sizes"]) > 200:
         flow["sizes"] = flow["sizes"][-200:]
 
@@ -362,10 +394,13 @@ def detect_tls_fingerprints(
 
     Returns a list of alert strings.
     """
+    _L = _layers()
+    IP, TCP, Raw, TLS = _L["IP"], _L["TCP"], _L["Raw"], _L["TLS"]
+
     alerts: AlertList = []
 
     # ── Strategy 1: scapy TLS layer ─────────────────────────────────────
-    if TLS_AVAILABLE and packet.haslayer(TLS):
+    if TLS_AVAILABLE and TLS is not None and packet.haslayer(TLS):
         try:
             tls_layer = packet[TLS]
             flow = encrypted_flows[flow_key]
@@ -429,14 +464,17 @@ def analyze_encrypted_payload(
 
     Returns a list of alert strings.
     """
+    _L = _layers()
+    IP, Raw = _L["IP"], _L["Raw"]
+
     alerts: AlertList = []
 
     if not packet.haslayer(Raw):
         return alerts
 
-    payload: bytes      = bytes(packet[Raw])
-    flow                = encrypted_flows[flow_key]
-    entropy: float      = calculate_entropy(payload)
+    payload: bytes = bytes(packet[Raw])
+    flow           = encrypted_flows[flow_key]
+    entropy: float = calculate_entropy(payload)
     flow["entropy_scores"].append(entropy)
 
     if entropy <= 7.5:
@@ -506,6 +544,9 @@ def detect_encrypted_agent_traffic(
 
     Returns a list of alert strings.
     """
+    _L = _layers()
+    IP, TCP = _L["IP"], _L["TCP"]
+
     alerts: AlertList = []
 
     if not (packet.haslayer(IP) and packet.haslayer(TCP)):
@@ -575,8 +616,11 @@ def analyze_traffic_patterns(
 
     Returns a list of alert strings.
     """
-    alerts: AlertList  = []
-    current_time       = datetime.now()
+    _L = _layers()
+    IP, TCP, UDP = _L["IP"], _L["TCP"], _L["UDP"]
+
+    alerts: AlertList = []
+    current_time      = datetime.now()
 
     if not packet.haslayer(IP):
         return alerts
