@@ -1,58 +1,98 @@
 """
-detectors.py — All packet-level detection logic:
-    * AI/ML service traffic
-    * Agent protocol detection (A2A, ACP, MCP)
-    * Protocol signature scanning
-    * Encrypted traffic analysis
-    * General traffic pattern anomalies
+detectors.py — All packet-level detection logic.
+
+Detectors are pure functions: they receive state as arguments and return
+lists of alert strings.  No global mutable state; no side effects beyond
+the mutable containers passed in.
+
+Covered detection categories
+-----------------------------
+* AI / ML service traffic (DNS + high-frequency TCP)
+* Agent protocol traffic  (A2A, ACP, MCP — ports + payload patterns)
+* Protocol signature scanning (JSON-RPC, coordination keywords)
+* Encrypted traffic analysis (TLS fingerprinting, entropy, flow patterns)
+* General traffic-rate anomalies
+
+Dependencies
+------------
+    scapy >= 2.4   (scapy.all, optionally scapy.layers.tls)
+    Python >= 3.10 (uses match-free stdlib only; X | Y union type hints)
 """
+
+from __future__ import annotations
 
 import re
 import statistics
-from collections import Counter, defaultdict, deque
+from collections import Counter
+from collections import defaultdict as _DefaultDict  # type alias only
 from datetime import datetime, timedelta
+from typing import TYPE_CHECKING
 
 try:
-    from scapy.all import IP, TCP, UDP, DNS, Raw
+    from scapy.all import DNS, IP, Raw, TCP, UDP
     try:
         from scapy.layers.tls import TLS
         TLS_AVAILABLE = True
     except ImportError:
         TLS_AVAILABLE = False
-except ImportError as e:
-    raise ImportError(f"Required package missing: {e}") from e
+        TLS = None  # type: ignore[assignment]
+except ImportError as exc:
+    raise ImportError(
+        f"Required package missing: {exc}\n"
+        "Install with: pip install scapy"
+    ) from exc
 
 from .config import (
-    AI_PROTOCOLS,
     AGENT_PROTOCOLS,
-    AI_AGENT_PATTERNS,
-    JSON_RPC_AGENT_PATTERNS,
-    COORDINATION_KEYWORDS,
     AGENT_TLS_PATTERNS,
+    AI_PROTOCOLS,
     AI_STANDARD_PORTS,
     BASELINE_WINDOW,
+    COORDINATION_KEYWORDS,
+    JSON_RPC_AGENT_PATTERNS,
 )
 from .crypto_utils import calculate_entropy, chi_square_uniformity
+
+# ---------------------------------------------------------------------------
+# Type aliases (for readability — no runtime cost)
+# ---------------------------------------------------------------------------
+
+AlertList   = list[str]
+FlowStore   = _DefaultDict  # defaultdict[str, dict]
+CountStore  = _DefaultDict  # defaultdict[str, int]
+ConnStore   = _DefaultDict  # defaultdict[str, list]
 
 
 # ---------------------------------------------------------------------------
 # AI / ML service detection
 # ---------------------------------------------------------------------------
 
-def detect_ai_traffic(packet, dns_queries, connection_counts, agent_protocols_cfg):
-    """Detect potential AI/ML API traffic. Returns a list of alert strings."""
-    alerts = []
+def detect_ai_traffic(
+    packet,
+    dns_queries,
+    connection_counts: CountStore,
+    agent_protocols_cfg: dict,
+) -> AlertList:
+    """
+    Detect potential AI/ML API traffic.
+
+    Checks DNS queries against known AI service domains and monitors TCP
+    connections to AI/agent ports for high-frequency patterns.
+
+    Returns a list of alert strings (empty if nothing detected).
+    """
+    alerts: AlertList = []
 
     if not packet.haslayer(IP):
         return alerts
 
-    # DNS-level detection
+    # ── DNS query inspection ─────────────────────────────────────────────
     if packet.haslayer(DNS) and packet[DNS].qr == 0:
-        query = packet[DNS].qd.qname.decode('utf-8').rstrip('.')
+        query: str = packet[DNS].qd.qname.decode("utf-8").rstrip(".")
         dns_queries.append({
-            'timestamp': datetime.now(),
-            'query': query,
-            'src_ip': packet[IP].src,
+            "timestamp": datetime.now(),
+            "query":     query,
+            "src_ip":    packet[IP].src,
         })
         for service, domains in AI_PROTOCOLS.items():
             for domain in domains:
@@ -61,15 +101,17 @@ def detect_ai_traffic(packet, dns_queries, connection_counts, agent_protocols_cf
                         f"AI Service DNS Query: {service} - {query} from {packet[IP].src}"
                     )
 
-    # TCP connection-level detection
+    # ── TCP connection frequency ─────────────────────────────────────────
     if packet.haslayer(TCP):
-        src_ip = packet[IP].src
-        dst_ip = packet[IP].dst
-        dst_port = packet[TCP].dport
+        src_ip:   str = packet[IP].src
+        dst_ip:   str = packet[IP].dst
+        dst_port: int = packet[TCP].dport
 
-        agent_ports = []
-        for cfg in agent_protocols_cfg.values():
-            agent_ports.extend(cfg['ports'])
+        agent_ports: list[int] = [
+            port
+            for cfg in agent_protocols_cfg.values()
+            for port in cfg["ports"]
+        ]
         all_monitored_ports = AI_STANDARD_PORTS + agent_ports
 
         if dst_port in all_monitored_ports:
@@ -88,25 +130,38 @@ def detect_ai_traffic(packet, dns_queries, connection_counts, agent_protocols_cf
 # Agent protocol detection (A2A / ACP / MCP)
 # ---------------------------------------------------------------------------
 
-def detect_agent_protocols(packet, agent_connections, protocol_sessions, suspicious_patterns):
-    """Detect A2A, ACP, and MCP protocol traffic. Returns a list of alert strings."""
-    alerts = []
+def detect_agent_protocols(
+    packet,
+    agent_connections: ConnStore,
+    protocol_sessions: CountStore,
+    suspicious_patterns: CountStore,
+) -> AlertList:
+    """
+    Detect A2A, ACP, and MCP protocol traffic by port number.
+
+    Also identifies agent mesh networks (both src and dst on agent ports)
+    and potential swarm activity (> 20 agent connections within 60 s).
+
+    Returns a list of alert strings.
+    """
+    alerts: AlertList = []
 
     if not (packet.haslayer(IP) and packet.haslayer(TCP)):
         return alerts
 
-    src_ip   = packet[IP].src
-    dst_ip   = packet[IP].dst
-    dst_port = packet[TCP].dport
-    src_port = packet[TCP].sport
+    src_ip:   str = packet[IP].src
+    dst_ip:   str = packet[IP].dst
+    dst_port: int = packet[TCP].dport
+    src_port: int = packet[TCP].sport
 
-    for protocol_name, config in AGENT_PROTOCOLS.items():
-        if dst_port in config['ports'] or src_port in config['ports']:
+    # ── Per-protocol port matching ───────────────────────────────────────
+    for protocol_name, cfg in AGENT_PROTOCOLS.items():
+        if dst_port in cfg["ports"] or src_port in cfg["ports"]:
             conn_key = f"{src_ip}:{dst_ip}:{dst_port}"
             agent_connections[protocol_name].append({
-                'timestamp': datetime.now(),
-                'connection': conn_key,
-                'direction': 'outbound' if dst_port in config['ports'] else 'inbound',
+                "timestamp":  datetime.now(),
+                "connection": conn_key,
+                "direction":  "outbound" if dst_port in cfg["ports"] else "inbound",
             })
             protocol_sessions[protocol_name] += 1
             alerts.append(
@@ -114,33 +169,31 @@ def detect_agent_protocols(packet, agent_connections, protocol_sessions, suspici
                 f"(Session #{protocol_sessions[protocol_name]})"
             )
 
-    # Detect potential agent mesh networks
-    all_agent_ports = []
-    for cfg in AGENT_PROTOCOLS.values():
-        all_agent_ports.extend(cfg['ports'])
-
+    # ── Agent mesh detection ─────────────────────────────────────────────
+    all_agent_ports: list[int] = [
+        port for cfg in AGENT_PROTOCOLS.values() for port in cfg["ports"]
+    ]
     if dst_port in all_agent_ports and src_port in all_agent_ports:
         alerts.append(
             f"Agent-to-Agent Communication Detected: "
             f"{src_ip}:{src_port} <-> {dst_ip}:{dst_port}"
         )
-        suspicious_patterns['agent_mesh'] += 1
+        suspicious_patterns["agent_mesh"] += 1
 
-    # Rapid successive connections → agent swarm
+    # ── Swarm detection ──────────────────────────────────────────────────
     current_time = datetime.now()
-    recent_connections = []
-    for protocol_conns in agent_connections.values():
-        recent_connections.extend(
-            c for c in protocol_conns
-            if (current_time - c['timestamp']).total_seconds() < 60
-        )
-
+    recent_connections = [
+        c
+        for conns in agent_connections.values()
+        for c in conns
+        if (current_time - c["timestamp"]).total_seconds() < 60
+    ]
     if len(recent_connections) > 20:
         alerts.append(
             f"Potential Agent Swarm Activity: "
             f"{len(recent_connections)} connections in last minute"
         )
-        suspicious_patterns['swarm_activity'] += 1
+        suspicious_patterns["swarm_activity"] += 1
 
     return alerts
 
@@ -149,44 +202,56 @@ def detect_agent_protocols(packet, agent_connections, protocol_sessions, suspici
 # Protocol signature scanning
 # ---------------------------------------------------------------------------
 
-def detect_protocol_signatures(packet, suspicious_patterns):
-    """Detect protocol-specific signatures in packet payload. Returns a list of alert strings."""
-    alerts = []
+def detect_protocol_signatures(
+    packet,
+    suspicious_patterns: CountStore,
+) -> AlertList:
+    """
+    Detect protocol-specific signatures in the TCP payload.
 
-    if not (packet.haslayer(TCP) and hasattr(packet[TCP], 'payload')):
+    Scans for:
+    * Agent protocol URL patterns (A2A / ACP / MCP path strings)
+    * JSON-RPC method names common in agent frameworks
+    * Multi-agent coordination keywords
+
+    Returns a list of alert strings.
+    """
+    alerts: AlertList = []
+
+    if not (packet.haslayer(TCP) and hasattr(packet[TCP], "payload")):
         return alerts
 
     try:
-        payload = str(packet[TCP].payload)
+        payload: str = str(packet[TCP].payload)
 
-        # Agent protocol URL/content patterns
-        for protocol_name, config in AGENT_PROTOCOLS.items():
-            for pattern in config['patterns']:
+        # Agent protocol URL / content-type patterns
+        for protocol_name, cfg in AGENT_PROTOCOLS.items():
+            for pattern in cfg["patterns"]:
                 if re.search(pattern, payload, re.IGNORECASE):
                     alerts.append(
                         f"{protocol_name.upper()} Protocol Pattern Detected: "
                         f"{pattern} in traffic from {packet[IP].src}"
                     )
-                    suspicious_patterns[f'{protocol_name}_pattern'] += 1
+                    suspicious_patterns[f"{protocol_name}_pattern"] += 1
 
-        # JSON-RPC agent patterns
+        # JSON-RPC agent method patterns
         for pattern in JSON_RPC_AGENT_PATTERNS:
             if re.search(pattern, payload, re.IGNORECASE):
                 alerts.append(
                     f"Agent JSON-RPC Communication: {pattern[:30]}... "
                     f"from {packet[IP].src}"
                 )
-                suspicious_patterns['json_rpc_agent'] += 1
+                suspicious_patterns["json_rpc_agent"] += 1
 
-        # Multi-agent coordination keywords
+        # Multi-agent coordination keywords — at most one alert per packet
         for keyword in COORDINATION_KEYWORDS:
             if keyword.lower() in payload.lower():
                 alerts.append(
                     f"Multi-Agent Coordination Keyword: '{keyword}' "
                     f"detected from {packet[IP].src}"
                 )
-                suspicious_patterns['coordination'] += 1
-                break  # one alert per packet
+                suspicious_patterns["coordination"] += 1
+                break
 
     except (UnicodeDecodeError, AttributeError):
         pass
@@ -195,25 +260,36 @@ def detect_protocol_signatures(packet, suspicious_patterns):
 
 
 # ---------------------------------------------------------------------------
-# Encrypted traffic analysis helpers
+# Encrypted traffic: timing analysis
 # ---------------------------------------------------------------------------
 
-def analyze_packet_timing(flow_key, timestamp, encrypted_flows):
-    """Analyse timing patterns in an encrypted flow. Returns an alert string or None."""
+def analyze_packet_timing(
+    flow_key: str,
+    timestamp: datetime,
+    encrypted_flows: FlowStore,
+) -> str | None:
+    """
+    Append *timestamp* to the flow's timing list and check for suspiciously
+    regular inter-packet intervals (indicative of automated heartbeats).
+
+    Returns an alert string if a regular pattern is detected, otherwise None.
+    """
     flow = encrypted_flows[flow_key]
-    flow['timing'].append(timestamp)
+    flow["timing"].append(timestamp)
 
-    if len(flow['timing']) > 100:
-        flow['timing'] = flow['timing'][-100:]
+    # Cap history to the most recent 100 entries
+    if len(flow["timing"]) > 100:
+        flow["timing"] = flow["timing"][-100:]
 
-    if len(flow['timing']) >= 5:
+    if len(flow["timing"]) >= 5:
         intervals = [
-            (flow['timing'][i] - flow['timing'][i - 1]).total_seconds()
-            for i in range(1, len(flow['timing']))
+            (flow["timing"][i] - flow["timing"][i - 1]).total_seconds()
+            for i in range(1, len(flow["timing"]))
         ]
         if len(intervals) >= 10:
             mean_interval = statistics.mean(intervals)
-            std_interval  = statistics.stdev(intervals) if len(intervals) > 1 else 0
+            std_interval  = statistics.stdev(intervals) if len(intervals) > 1 else 0.0
+            # Very regular AND within a sensible heartbeat range
             if std_interval < mean_interval * 0.1 and 0.1 <= mean_interval <= 60:
                 return (
                     f"Regular encrypted communication pattern detected: "
@@ -223,27 +299,42 @@ def analyze_packet_timing(flow_key, timestamp, encrypted_flows):
     return None
 
 
-def analyze_packet_sizes(flow_key, size, encrypted_flows):
-    """Analyse packet size patterns in an encrypted flow. Returns an alert string or None."""
+# ---------------------------------------------------------------------------
+# Encrypted traffic: packet size analysis
+# ---------------------------------------------------------------------------
+
+def analyze_packet_sizes(
+    flow_key: str,
+    size: int,
+    encrypted_flows: FlowStore,
+) -> str | None:
+    """
+    Append *size* to the flow's size history and look for:
+    * A single size dominating > 30 % of all packets (protocol header pattern)
+    * Alternating small-then-large bursts (control + data pattern)
+
+    Returns an alert string if a pattern is detected, otherwise None.
+    """
     flow = encrypted_flows[flow_key]
-    flow['sizes'].append(size)
+    flow["sizes"].append(size)
 
-    if len(flow['sizes']) > 200:
-        flow['sizes'] = flow['sizes'][-200:]
+    # Cap history to the most recent 200 entries
+    if len(flow["sizes"]) > 200:
+        flow["sizes"] = flow["sizes"][-200:]
 
-    if len(flow['sizes']) >= 20:
-        size_counter = Counter(flow['sizes'])
+    if len(flow["sizes"]) >= 20:
+        size_counter = Counter(flow["sizes"])
         for sz, count in size_counter.most_common(5):
-            if count > len(flow['sizes']) * 0.3:
+            if count > len(flow["sizes"]) * 0.3:
                 return (
                     f"Repeated packet size pattern: {sz} bytes "
                     f"({count}/{len(flow['sizes'])} packets)"
                 )
 
-        recent_sizes = flow['sizes'][-10:]
+        recent = flow["sizes"][-10:]
         small_then_large = sum(
-            1 for i in range(len(recent_sizes) - 1)
-            if recent_sizes[i] < 100 and recent_sizes[i + 1] > 1000
+            1 for i in range(len(recent) - 1)
+            if recent[i] < 100 and recent[i + 1] > 1000
         )
         if small_then_large > 3:
             return "Agent-like communication pattern: small control + large data transfers"
@@ -251,138 +342,189 @@ def analyze_packet_sizes(flow_key, size, encrypted_flows):
     return None
 
 
-def detect_tls_fingerprints(packet, flow_key, encrypted_flows, encryption_patterns):
-    """Analyse TLS handshake for agent protocol fingerprints. Returns a list of alert strings."""
-    alerts = []
+# ---------------------------------------------------------------------------
+# Encrypted traffic: TLS fingerprinting
+# ---------------------------------------------------------------------------
 
-    if TLS_AVAILABLE:
+def detect_tls_fingerprints(
+    packet,
+    flow_key: str,
+    encrypted_flows: FlowStore,
+    encryption_patterns: CountStore,
+) -> AlertList:
+    """
+    Analyse TLS handshake data for agent-software fingerprints.
+
+    Two strategies are applied:
+    1. If scapy's TLS layer is available, parse the TLS message directly.
+    2. Inspect the raw payload bytes for TLS record type (0x16) and
+       Client Hello marker — works regardless of TLS layer availability.
+
+    Returns a list of alert strings.
+    """
+    alerts: AlertList = []
+
+    # ── Strategy 1: scapy TLS layer ─────────────────────────────────────
+    if TLS_AVAILABLE and packet.haslayer(TLS):
         try:
-            if packet.haslayer(TLS):
-                tls_layer = packet[TLS]
-                flow = encrypted_flows[flow_key]
+            tls_layer = packet[TLS]
+            flow = encrypted_flows[flow_key]
 
-                if hasattr(tls_layer, 'version'):
-                    flow['tls_info']['version'] = tls_layer.version
+            if hasattr(tls_layer, "version"):
+                flow["tls_info"]["version"] = tls_layer.version
 
-                if hasattr(tls_layer, 'msg') and tls_layer.msg:
-                    tls_data = bytes(tls_layer.msg)
+            if hasattr(tls_layer, "msg") and tls_layer.msg:
+                tls_data = bytes(tls_layer.msg)
 
-                    if b'\x00\x17' in tls_data:
-                        flow['tls_info']['extended_master_secret'] = True
+                if b"\x00\x17" in tls_data:
+                    flow["tls_info"]["extended_master_secret"] = True
 
-                    for pattern in AGENT_TLS_PATTERNS:
-                        if pattern in tls_data:
-                            alerts.append(
-                                f"TLS fingerprint suggests agent software: "
-                                f"{pattern.decode('utf-8', errors='ignore')}"
-                            )
-                            encryption_patterns['agent_tls_library'] += 1
+                for pattern in AGENT_TLS_PATTERNS:
+                    if pattern in tls_data:
+                        alerts.append(
+                            f"TLS fingerprint suggests agent software: "
+                            f"{pattern.decode('utf-8', errors='ignore')}"
+                        )
+                        encryption_patterns["agent_tls_library"] += 1
         except Exception:
-            pass
+            pass  # degrade gracefully to strategy 2
 
-    # Fallback raw TLS detection
+    # ── Strategy 2: raw byte inspection ─────────────────────────────────
     if packet.haslayer(TCP) and packet.haslayer(Raw):
         payload = bytes(packet[Raw])
         if len(payload) >= 6:
-            if payload[0] == 0x16:
+            if payload[0] == 0x16:  # TLS Handshake record type
                 tls_version = (payload[1] << 8) | payload[2]
                 alerts.append(
                     f"TLS handshake detected (version: 0x{tls_version:04x}) "
                     f"from {packet[IP].src}"
                 )
-                encryption_patterns['tls_handshake'] += 1
+                encryption_patterns["tls_handshake"] += 1
 
-            if b'\x01\x00' in payload[:10]:
+            if b"\x01\x00" in payload[:10]:  # Client Hello message type
                 alerts.append(f"TLS Client Hello detected from {packet[IP].src}")
-                encryption_patterns['tls_client_hello'] += 1
+                encryption_patterns["tls_client_hello"] += 1
 
     return alerts
 
 
-def analyze_encrypted_payload(packet, flow_key, encrypted_flows, encryption_patterns):
-    """Analyse encrypted payload for patterns without decrypting. Returns a list of alert strings."""
-    alerts = []
+# ---------------------------------------------------------------------------
+# Encrypted traffic: payload pattern analysis
+# ---------------------------------------------------------------------------
+
+def analyze_encrypted_payload(
+    packet,
+    flow_key: str,
+    encrypted_flows: FlowStore,
+    encryption_patterns: CountStore,
+) -> AlertList:
+    """
+    Analyse an encrypted payload for structural patterns without decrypting it.
+
+    High-entropy payloads (> 7.5 bits) are checked for:
+    * Repeated 16-byte headers
+    * Alternating request/response size patterns
+    * Potential nested base64 encoding
+    * Non-uniform byte distribution (chi-square > 300)
+
+    Returns a list of alert strings.
+    """
+    alerts: AlertList = []
 
     if not packet.haslayer(Raw):
         return alerts
 
-    payload = bytes(packet[Raw])
-    flow = encrypted_flows[flow_key]
-    entropy = calculate_entropy(payload)
-    flow['entropy_scores'].append(entropy)
+    payload: bytes      = bytes(packet[Raw])
+    flow                = encrypted_flows[flow_key]
+    entropy: float      = calculate_entropy(payload)
+    flow["entropy_scores"].append(entropy)
 
-    if entropy > 7.5:
-        # Repeated header pattern
-        if len(payload) >= 16:
-            header = payload[:16]
-            if payload.count(header) > 1:
-                alerts.append(
-                    f"Repeated header pattern in encrypted stream from {packet[IP].src}"
-                )
-                encryption_patterns['repeated_headers'] += 1
+    if entropy <= 7.5:
+        return alerts  # low entropy — not encrypted, no further analysis
 
-        # Length pattern analysis
-        payload_len = len(payload)
-        flow['flow_patterns'].append(payload_len)
-
-        if len(flow['flow_patterns']) >= 10:
-            recent_patterns = flow['flow_patterns'][-10:]
-            alternating = all(
-                abs(recent_patterns[i] - recent_patterns[i - 1]) >= 50
-                for i in range(1, len(recent_patterns))
+    # ── Repeated header check ────────────────────────────────────────────
+    if len(payload) >= 16:
+        header = payload[:16]
+        if payload.count(header) > 1:
+            alerts.append(
+                f"Repeated header pattern in encrypted stream from {packet[IP].src}"
             )
-            if alternating and len(set(recent_patterns)) <= 3:
-                alerts.append("Encrypted request/response pattern suggests agent protocol")
-                encryption_patterns['req_resp_pattern'] += 1
+            encryption_patterns["repeated_headers"] += 1
 
-        # Nested base64 encoding check
-        if len(payload) > 50:
-            try:
-                decoded_attempt = payload.decode('utf-8', errors='ignore')
-                base64_chars = set(
-                    'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/='
-                )
-                if len(set(decoded_attempt) & base64_chars) > len(decoded_attempt) * 0.8:
-                    alerts.append("Potential nested encoding in encrypted stream")
-                    encryption_patterns['nested_encoding'] += 1
-            except Exception:
-                pass
+    # ── Request/response length pattern ─────────────────────────────────
+    flow["flow_patterns"].append(len(payload))
+    if len(flow["flow_patterns"]) >= 10:
+        recent = flow["flow_patterns"][-10:]
+        alternating = all(
+            abs(recent[i] - recent[i - 1]) >= 50
+            for i in range(1, len(recent))
+        )
+        if alternating and len(set(recent)) <= 3:
+            alerts.append("Encrypted request/response pattern suggests agent protocol")
+            encryption_patterns["req_resp_pattern"] += 1
 
-        # Chi-square byte uniformity test
-        if len(payload) >= 100:
-            chi_square = chi_square_uniformity(payload)
-            if chi_square > 300:
-                alerts.append(
-                    "Unusual byte distribution in encrypted data suggests nested protocols"
-                )
-                encryption_patterns['unusual_distribution'] += 1
+    # ── Nested base64 encoding check ─────────────────────────────────────
+    if len(payload) > 50:
+        try:
+            decoded = payload.decode("utf-8", errors="ignore")
+            base64_chars = set(
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="
+            )
+            if len(decoded) > 0 and len(set(decoded) & base64_chars) > len(decoded) * 0.8:
+                alerts.append("Potential nested encoding in encrypted stream")
+                encryption_patterns["nested_encoding"] += 1
+        except Exception:
+            pass
+
+    # ── Chi-square byte uniformity test ─────────────────────────────────
+    if len(payload) >= 100:
+        chi_sq = chi_square_uniformity(payload)
+        if chi_sq > 300:
+            alerts.append(
+                "Unusual byte distribution in encrypted data suggests nested protocols"
+            )
+            encryption_patterns["unusual_distribution"] += 1
 
     return alerts
 
 
 # ---------------------------------------------------------------------------
-# Encrypted traffic orchestrator
+# Encrypted traffic: orchestrator
 # ---------------------------------------------------------------------------
 
-def detect_encrypted_agent_traffic(packet, encrypted_flows, encryption_patterns):
-    """Main entry point for encrypted-traffic analysis. Returns a list of alert strings."""
-    alerts = []
+def detect_encrypted_agent_traffic(
+    packet,
+    encrypted_flows: FlowStore,
+    encryption_patterns: CountStore,
+) -> AlertList:
+    """
+    Main entry point for encrypted-traffic analysis.
+
+    Builds a per-flow record keyed by ``src_ip:dst_ip:dst_port``, then
+    delegates to the four specialised helpers and performs flow-level
+    rate and persistence checks.
+
+    Returns a list of alert strings.
+    """
+    alerts: AlertList = []
 
     if not (packet.haslayer(IP) and packet.haslayer(TCP)):
         return alerts
 
-    src_ip    = packet[IP].src
-    dst_ip    = packet[IP].dst
-    dst_port  = packet[TCP].dport
-    flow_key  = f"{src_ip}:{dst_ip}:{dst_port}"
-    timestamp = datetime.now()
-    packet_size = len(packet)
+    src_ip:      str      = packet[IP].src
+    dst_ip:      str      = packet[IP].dst
+    dst_port:    int      = packet[TCP].dport
+    flow_key:    str      = f"{src_ip}:{dst_ip}:{dst_port}"
+    timestamp:   datetime = datetime.now()
+    packet_size: int      = len(packet)
 
+    # ── Maintain bounded packet timestamp list ───────────────────────────
     flow = encrypted_flows[flow_key]
-    flow['packets'].append(timestamp)
-    if len(flow['packets']) > 500:
-        flow['packets'] = flow['packets'][-500:]
+    flow["packets"].append(timestamp)
+    if len(flow["packets"]) > 500:
+        flow["packets"] = flow["packets"][-500:]
 
+    # ── Delegate to specialised helpers ─────────────────────────────────
     timing_alert = analyze_packet_timing(flow_key, timestamp, encrypted_flows)
     if timing_alert:
         alerts.append(timing_alert)
@@ -394,23 +536,23 @@ def detect_encrypted_agent_traffic(packet, encrypted_flows, encryption_patterns)
     alerts.extend(detect_tls_fingerprints(packet, flow_key, encrypted_flows, encryption_patterns))
     alerts.extend(analyze_encrypted_payload(packet, flow_key, encrypted_flows, encryption_patterns))
 
-    # Flow-level rate / persistence checks
-    if len(flow['packets']) >= 50:
-        recent_packets = [p for p in flow['packets'] if (timestamp - p).total_seconds() < 60]
-        ppm = len(recent_packets)
+    # ── Flow-level rate and persistence checks ───────────────────────────
+    if len(flow["packets"]) >= 50:
+        recent_pkts = [p for p in flow["packets"] if (timestamp - p).total_seconds() < 60]
+        ppm = len(recent_pkts)
         if ppm > 30:
             alerts.append(
                 f"High-frequency encrypted communication: {ppm} ppm to {dst_ip}:{dst_port}"
             )
-            encryption_patterns['high_freq_encrypted'] += 1
+            encryption_patterns["high_freq_encrypted"] += 1
 
-        session_duration = (timestamp - flow['packets'][0]).total_seconds()
+        session_duration = (timestamp - flow["packets"][0]).total_seconds()
         if session_duration > 1800:
             alerts.append(
                 f"Long-lived encrypted session: {session_duration / 60:.1f} minutes "
                 f"to {dst_ip}:{dst_port}"
             )
-            encryption_patterns['persistent_encrypted'] += 1
+            encryption_patterns["persistent_encrypted"] += 1
 
     return alerts
 
@@ -419,20 +561,32 @@ def detect_encrypted_agent_traffic(packet, encrypted_flows, encryption_patterns)
 # General traffic pattern analysis
 # ---------------------------------------------------------------------------
 
-def analyze_traffic_patterns(packet, traffic_stats, protocol_stats):
-    """Analyse traffic for anomalous patterns. Returns a list of alert strings."""
-    alerts = []
-    current_time = datetime.now()
+def analyze_traffic_patterns(
+    packet,
+    traffic_stats,
+    protocol_stats: CountStore,
+) -> AlertList:
+    """
+    Analyse general traffic patterns for anomalies.
+
+    * Tracks per-source-IP packet timestamps within a rolling baseline window.
+    * Alerts when the per-IP packet rate exceeds 10 packets/second.
+    * Counts TCP and UDP packets for the protocol distribution report.
+
+    Returns a list of alert strings.
+    """
+    alerts: AlertList  = []
+    current_time       = datetime.now()
 
     if not packet.haslayer(IP):
         return alerts
 
-    src_ip = packet[IP].src
+    src_ip: str = packet[IP].src
     traffic_stats[src_ip].append(current_time)
 
     # Evict entries older than the baseline window
-    cutoff_time = current_time - timedelta(seconds=BASELINE_WINDOW)
-    while traffic_stats[src_ip] and traffic_stats[src_ip][0] < cutoff_time:
+    cutoff = current_time - timedelta(seconds=BASELINE_WINDOW)
+    while traffic_stats[src_ip] and traffic_stats[src_ip][0] < cutoff:
         traffic_stats[src_ip].popleft()
 
     if len(traffic_stats[src_ip]) > 10:
@@ -443,8 +597,8 @@ def analyze_traffic_patterns(packet, traffic_stats, protocol_stats):
                 alerts.append(f"High packet rate from {src_ip}: {packet_rate:.2f} pps")
 
     if packet.haslayer(TCP):
-        protocol_stats['TCP'] += 1
+        protocol_stats["TCP"] += 1
     elif packet.haslayer(UDP):
-        protocol_stats['UDP'] += 1
+        protocol_stats["UDP"] += 1
 
     return alerts

@@ -2,37 +2,59 @@
 """
 main.py — Entry point for the Network Anomaly Detection and AI Agent Protocol Monitor.
 
-Usage:
-    sudo python main.py
+Usage
+-----
+    sudo python main.py            # Linux / macOS
+    python main.py                 # Windows (run as Administrator)
 
-Requires: pip install scapy psutil requests scipy numpy
-Run with elevated privileges (sudo on Linux/Mac, admin on Windows).
+Requirements
+------------
+    pip install scapy psutil
+
+Elevated privileges are required for raw-socket packet capture.
 """
 
+from __future__ import annotations
+
 import socket
+import sys
+
+# Guard: require Python 3.10+ (union type syntax used throughout the package)
+if sys.version_info < (3, 10):
+    sys.exit(
+        f"Python 3.10 or later is required (running {sys.version_info.major}"
+        f".{sys.version_info.minor})."
+    )
 
 from network_anomaly_monitor.monitor import NetworkMonitor
 
 
-def check_privileges():
-    """Verify the process has sufficient privileges for raw-socket capture."""
+def check_privileges() -> bool:
+    """
+    Return True if the process has sufficient privileges for raw-socket capture.
+
+    On Linux/macOS this requires root / sudo.
+    On Windows this requires running as Administrator.
+    """
     try:
-        socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_IP)
+        s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_IP)
+        s.close()
     except PermissionError:
         print("ERROR: This script requires elevated privileges.")
-        print("Please run as administrator (Windows) or with sudo (Linux/Mac)")
+        print("  Linux / macOS : sudo python main.py")
+        print("  Windows       : run as Administrator")
         return False
     except OSError:
-        pass  # Expected on some systems
+        pass  # Some platforms raise OSError for unrelated reasons — continue.
     return True
 
 
-def main():
+def main() -> None:
     print("Network Anomaly Detection and AI Agent Protocol Monitor")
     print("=" * 55)
 
     if not check_privileges():
-        return
+        sys.exit(1)
 
     monitor = NetworkMonitor()
     monitor.start_monitoring()
