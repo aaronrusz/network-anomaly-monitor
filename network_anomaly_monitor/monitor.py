@@ -18,14 +18,6 @@ from collections import defaultdict, deque
 from datetime import datetime
 from pathlib import Path
 
-try:
-    import psutil
-    from scapy.all import sniff
-except ImportError as exc:
-    raise ImportError(
-        f"Required package missing: {exc}\n"
-        "Install with: pip install scapy psutil"
-    ) from exc
 
 from .config import AGENT_PROTOCOLS, ALERT_THRESHOLD, BASELINE_WINDOW
 from .detectors import (
@@ -223,6 +215,13 @@ class NetworkMonitor:
 
     def get_network_interfaces(self) -> list[str]:
         """Return the names of all available network interfaces."""
+        try:
+            import psutil
+        except ImportError as exc:
+            raise ImportError(
+                "psutil is required to list network interfaces.\n"
+                "Install with: pip install psutil"
+            ) from exc
         return list(psutil.net_if_addrs().keys())
 
     def start_monitoring(self) -> None:
@@ -254,6 +253,14 @@ class NetworkMonitor:
 
         stats_thread = threading.Thread(target=self.periodic_stats, daemon=True)
         stats_thread.start()
+
+        try:
+            from scapy.all import sniff
+        except ImportError as exc:
+            raise ImportError(
+                "scapy is required for packet capture.\n"
+                "Install with: pip install scapy"
+            ) from exc
 
         try:
             sniff(
