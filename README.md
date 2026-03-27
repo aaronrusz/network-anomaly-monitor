@@ -18,7 +18,7 @@ This project is a Python-based tool for monitoring network traffic, detecting an
 * Dependencies:
 
   ```bash
-  pipx install scapy psutil requests scipy numpy
+  pip install scapy psutil requests scipy numpy
   ```
 * Optional:
 
