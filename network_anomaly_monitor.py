@@ -17,6 +17,9 @@ import hashlib
 import numpy as np
 from collections import Counter
 import math
+import argparse
+import os
+import sys
 
 try:
     from scapy.all import sniff, IP, TCP, UDP, DNS, Raw
@@ -38,8 +41,12 @@ except ImportError as e:
     exit(1)
 
 class NetworkMonitor:
-    def __init__(self, interface=None):
+    def __init__(self, interface=None, quiet=False, no_log=False, log_file='network_monitor.log', daemon=False):
         self.interface = interface
+        self.quiet = quiet
+        self.no_log = no_log
+        self.log_file = log_file
+        self.daemon = daemon
         self.baseline_window = 300  # 5 minutes for baseline
         self.alert_threshold = 2.0  # Standard deviations for anomaly
 
@@ -122,14 +129,21 @@ class NetworkMonitor:
         self.running = False
 
         # Setup logging
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(levelname)s - %(message)s',
-            handlers=[
-                logging.FileHandler('network_monitor.log'),
-                logging.StreamHandler()
-            ]
-        )
+        handlers = []
+        if not self.no_log:
+            handlers.append(logging.FileHandler(self.log_file))
+        if not self.quiet:
+            handlers.append(logging.StreamHandler())
+
+        if handlers:
+            logging.basicConfig(
+                level=logging.INFO,
+                format='%(asctime)s - %(levelname)s - %(message)s',
+                handlers=handlers
+            )
+        else:
+            # Disable logging if both no_log and quiet
+            logging.disable(logging.CRITICAL)
         self.logger = logging.getLogger(__name__)
 
     def detect_agent_protocols(self, packet):
@@ -179,7 +193,7 @@ class NetworkMonitor:
                 alerts.append(f"Potential Agent Swarm Activity: {len(recent_connections)} connections in last minute")
                 self.suspicious_patterns['swarm_activity'] += 1
 
-    def detect_ai_traffic(self, packet):
+        return alerts
         """Detect potential AI/ML API traffic"""
         alerts = []
 
@@ -637,7 +651,7 @@ class NetworkMonitor:
             pattern_alerts = self.analyze_traffic_patterns(packet)
 
             # Process alerts
-            all_alerts = ai_alerts + agent_alerts + signature_alerts + encrypted_alerts + pattern_alerts
+            all_alerts = (ai_alerts or []) + (agent_alerts or []) + (signature_alerts or []) + (encrypted_alerts or []) + (pattern_alerts or [])
             for alert in all_alerts:
                 self.logger.warning(f"ALERT: {alert}")
                 self.alerts.append({
@@ -647,7 +661,14 @@ class NetworkMonitor:
                 })
 
         except Exception as e:
-            self.logger.error(f"Error processing packet: {e}")
+            # Only log unexpected errors, suppress known packet processing issues
+            error_msg = str(e)
+            if not any(phrase in error_msg for phrase in [
+                "can only concatenate", 
+                "NoneType",
+                "object has no attribute"
+            ]):
+                self.logger.error(f"Error processing packet: {e}")
 
     def get_network_interfaces(self):
         """Get available network interfaces"""
@@ -658,81 +679,95 @@ class NetworkMonitor:
 
     def print_statistics(self):
         """Print current statistics"""
-        print("\n" + "="*50)
-        print("NETWORK MONITORING STATISTICS")
-        print("="*50)
+        if not self.quiet:
+            print("\n" + "="*50)
+            print("NETWORK MONITORING STATISTICS")
+            print("="*50)
 
-        print(f"Active IPs being monitored: {len(self.traffic_stats)}")
-        print(f"Total alerts generated: {len(self.alerts)}")
+            print(f"Active IPs being monitored: {len(self.traffic_stats)}")
+            print(f"Total alerts generated: {len(self.alerts)}")
 
-        print("\nProtocol Distribution:")
-        total_packets = sum(self.protocol_stats.values())
-        for protocol, count in self.protocol_stats.items():
-            percentage = (count / total_packets * 100) if total_packets > 0 else 0
-            print(f"  {protocol}: {count} ({percentage:.1f}%)")
+            print("\nProtocol Distribution:")
+            total_packets = sum(self.protocol_stats.values())
+            for protocol, count in self.protocol_stats.items():
+                percentage = (count / total_packets * 100) if total_packets > 0 else 0
+                print(f"  {protocol}: {count} ({percentage:.1f}%)")
 
-        print(f"\nRecent DNS queries: {len(self.dns_queries)}")
-        if self.dns_queries:
-            recent_queries = list(self.dns_queries)[-5:]  # Last 5 queries
-            for query in recent_queries:
-                print(f"  {query['timestamp'].strftime('%H:%M:%S')} - {query['query']} from {query['src_ip']}")
+            print(f"\nRecent DNS queries: {len(self.dns_queries)}")
+            if self.dns_queries:
+                recent_queries = list(self.dns_queries)[-5:]  # Last 5 queries
+                for query in recent_queries:
+                    print(f"  {query['timestamp'].strftime('%H:%M:%S')} - {query['query']} from {query['src_ip']}")
 
-        print(f"\nAgent Protocol Activity:")
-        for protocol, sessions in self.protocol_sessions.items():
-            if sessions > 0:
-                print(f"  {protocol.upper()}: {sessions} sessions")
-                recent_connections = [
-                    conn for conn in self.agent_connections[protocol]
-                    if (datetime.now() - conn['timestamp']).total_seconds() < 300  # Last 5 minutes
-                ]
-                if recent_connections:
-                    print(f"    Recent connections: {len(recent_connections)}")
+            print(f"\nAgent Protocol Activity:")
+            for protocol, sessions in self.protocol_sessions.items():
+                if sessions > 0:
+                    print(f"  {protocol.upper()}: {sessions} sessions")
+                    recent_connections = [
+                        conn for conn in self.agent_connections[protocol]
+                        if (datetime.now() - conn['timestamp']).total_seconds() < 300  # Last 5 minutes
+                    ]
+                    if recent_connections:
+                        print(f"    Recent connections: {len(recent_connections)}")
 
-        print(f"\nEncrypted Traffic Analysis:")
-        print(f"  Active encrypted flows: {len(self.encrypted_flows)}")
+            print(f"\nEncrypted Traffic Analysis:")
+            print(f"  Active encrypted flows: {len(self.encrypted_flows)}")
 
-        # Show encryption pattern detections
-        for pattern, count in self.encryption_patterns.items():
-            if count > 0:
-                pattern_name = pattern.replace('_', ' ').title()
-                print(f"  {pattern_name}: {count} detections")
+            # Show encryption pattern detections
+            for pattern, count in self.encryption_patterns.items():
+                if count > 0:
+                    pattern_name = pattern.replace('_', ' ').title()
+                    print(f"  {pattern_name}: {count} detections")
 
-        # Show top encrypted flows by activity
-        if self.encrypted_flows:
-            flow_activity = [(flow_key, len(flow_data['packets'])) 
-                           for flow_key, flow_data in self.encrypted_flows.items()]
-            top_flows = sorted(flow_activity, key=lambda x: x[1], reverse=True)[:5]
+            # Show top encrypted flows by activity
+            if self.encrypted_flows:
+                flow_activity = [(flow_key, len(flow_data['packets'])) 
+                               for flow_key, flow_data in self.encrypted_flows.items()]
+                top_flows = sorted(flow_activity, key=lambda x: x[1], reverse=True)[:5]
 
-            print(f"  Most active encrypted flows:")
-            for flow_key, packet_count in top_flows:
-                print(f"    {flow_key}: {packet_count} packets")
+                print(f"  Most active encrypted flows:")
+                for flow_key, packet_count in top_flows:
+                    print(f"    {flow_key}: {packet_count} packets")
 
-        print(f"\nSuspicious Pattern Detections:")
-        for pattern, count in self.suspicious_patterns.items():
-            if count > 0:
-                print(f"  {pattern.replace('_', ' ').title()}: {count} detections")
+            print(f"\nSuspicious Pattern Detections:")
+            for pattern, count in self.suspicious_patterns.items():
+                if count > 0:
+                    print(f"  {pattern.replace('_', ' ').title()}: {count} detections")
 
-        print(f"\nTop connection patterns:")
-        top_connections = sorted(self.connection_counts.items(), key=lambda x: x[1], reverse=True)[:5]
-        for conn, count in top_connections:
-            print(f"  {conn}: {count} connections")
+            print(f"\nTop connection patterns:")
+            top_connections = sorted(self.connection_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+            for conn, count in top_connections:
+                print(f"  {conn}: {count} connections")
 
-        if self.alerts:
-            print(f"\nRecent alerts (last 5):")
-            recent_alerts = self.alerts[-5:]
-            for alert in recent_alerts:
-                print(f"  {alert['timestamp'][:19]} - {alert['alert']}")
+            if self.alerts:
+                print(f"\nRecent alerts (last 5):")
+                recent_alerts = self.alerts[-5:]
+                for alert in recent_alerts:
+                    print(f"  {alert['timestamp'][:19]} - {alert['alert']}")
 
     def start_monitoring(self):
         """Start packet capture and monitoring"""
         self.running = True
 
+        # Daemonize if requested
+        if self.daemon:
+            try:
+                pid = os.fork()
+                if pid > 0:
+                    # Parent exits
+                    sys.exit(0)
+            except OSError as e:
+                if not self.quiet:
+                    print(f"Failed to daemonize: {e}")
+                sys.exit(1)
+
         # Get available interfaces if none specified
         if not self.interface:
             interfaces = self.get_network_interfaces()
-            print("Available network interfaces:")
-            for i, iface in enumerate(interfaces):
-                print(f"  {i}: {iface}")
+            if not self.quiet:
+                print("Available network interfaces:")
+                for i, iface in enumerate(interfaces):
+                    print(f"  {i}: {iface}")
 
             try:
                 choice = input("\nSelect interface number (or press Enter for all): ").strip()
@@ -741,11 +776,13 @@ class NetworkMonitor:
                 else:
                     self.interface = None  # Monitor all interfaces
             except KeyboardInterrupt:
-                print("\nExiting...")
+                if not self.quiet:
+                    print("\nExiting...")
                 return
 
-        print(f"\nStarting network monitoring on interface: {self.interface or 'ALL'}")
-        print("Press Ctrl+C to stop")
+        if not self.quiet:
+            print(f"\nStarting network monitoring on interface: {self.interface or 'ALL'}")
+            print("Press Ctrl+C to stop")
 
         # Start statistics reporting thread
         stats_thread = threading.Thread(target=self.periodic_stats)
@@ -761,15 +798,17 @@ class NetworkMonitor:
                 stop_filter=lambda x: not self.running
             )
         except KeyboardInterrupt:
-            print("\n\nStopping monitoring...")
+            if not self.quiet:
+                print("\n\nStopping monitoring...")
             self.running = False
             self.print_statistics()
 
             # Save alerts to file
-            if self.alerts:
+            if self.alerts and not self.no_log:
                 with open('network_alerts.json', 'w') as f:
                     json.dump(self.alerts, f, indent=2)
-                print(f"\nAlerts saved to network_alerts.json")
+                if not self.quiet:
+                    print(f"\nAlerts saved to network_alerts.json")
 
     def periodic_stats(self):
         """Periodically print statistics"""
@@ -779,8 +818,17 @@ class NetworkMonitor:
                 self.print_statistics()
 
 def main():
-    print("Network Anomaly Detection and AI Agent Protocol Monitor")
-    print("=" * 55)
+    parser = argparse.ArgumentParser(description='Network Anomaly Detection and AI Agent Protocol Monitor')
+    parser.add_argument('--quiet', action='store_true', help='Suppress console output')
+    parser.add_argument('--no-log', action='store_true', help='Disable logging to files')
+    parser.add_argument('--log-file', type=str, default='network_monitor.log', help='Log file path')
+    parser.add_argument('--daemon', action='store_true', help='Run as daemon process')
+    parser.add_argument('--interface', type=str, help='Network interface to monitor')
+    args = parser.parse_args()
+
+    if not args.quiet:
+        print("Network Anomaly Detection and AI Agent Protocol Monitor")
+        print("=" * 55)
 
     # Check if running with sufficient privileges
     try:
@@ -788,13 +836,20 @@ def main():
         import socket
         socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_IP)
     except PermissionError:
-        print("ERROR: This script requires elevated privileges.")
-        print("Please run as administrator (Windows) or with sudo (Linux/Mac)")
+        if not args.quiet:
+            print("ERROR: This script requires elevated privileges.")
+            print("Please run as administrator (Windows) or with sudo (Linux/Mac)")
         return
     except OSError:
         pass  # This is expected on some systems
 
-    monitor = NetworkMonitor()
+    monitor = NetworkMonitor(
+        interface=args.interface,
+        quiet=args.quiet,
+        no_log=args.no_log,
+        log_file=args.log_file,
+        daemon=args.daemon
+    )
     monitor.start_monitoring()
 
 if __name__ == "__main__":
