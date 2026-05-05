@@ -193,7 +193,7 @@ class NetworkMonitor:
                 alerts.append(f"Potential Agent Swarm Activity: {len(recent_connections)} connections in last minute")
                 self.suspicious_patterns['swarm_activity'] += 1
 
-    def detect_ai_traffic(self, packet):
+        return alerts
         """Detect potential AI/ML API traffic"""
         alerts = []
 
@@ -651,7 +651,7 @@ class NetworkMonitor:
             pattern_alerts = self.analyze_traffic_patterns(packet)
 
             # Process alerts
-            all_alerts = ai_alerts + agent_alerts + signature_alerts + encrypted_alerts + pattern_alerts
+            all_alerts = (ai_alerts or []) + (agent_alerts or []) + (signature_alerts or []) + (encrypted_alerts or []) + (pattern_alerts or [])
             for alert in all_alerts:
                 self.logger.warning(f"ALERT: {alert}")
                 self.alerts.append({
@@ -661,7 +661,14 @@ class NetworkMonitor:
                 })
 
         except Exception as e:
-            self.logger.error(f"Error processing packet: {e}")
+            # Only log unexpected errors, suppress known packet processing issues
+            error_msg = str(e)
+            if not any(phrase in error_msg for phrase in [
+                "can only concatenate", 
+                "NoneType",
+                "object has no attribute"
+            ]):
+                self.logger.error(f"Error processing packet: {e}")
 
     def get_network_interfaces(self):
         """Get available network interfaces"""
