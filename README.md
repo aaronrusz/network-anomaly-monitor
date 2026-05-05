@@ -16,11 +16,14 @@ This project is a Python-based tool for monitoring network traffic, detecting an
 ## Requirements
 
 * Python 3.8+
-* Dependencies:
+* Dependencies (install system-wide for sudo compatibility):
 
   ```bash
-  pip install scapy psutil requests scipy numpy
+  sudo pip3 install scapy psutil requests scipy numpy
   ```
+  
+  > **Important:** Install packages system-wide with `sudo pip3` rather than `pip3` to ensure they are available when running the script with elevated privileges.
+
 * Optional:
 
   * TLS support (requires compatible `scapy` version with `scapy.layers.tls`).
@@ -29,9 +32,9 @@ This project is a Python-based tool for monitoring network traffic, detecting an
 
 > ⚠️ **Note:** This program requires elevated privileges (e.g., `sudo` on Linux/Mac or administrator rights on Windows) to capture network traffic.
 
-### Basic Usage
+### Interactive Mode
 
-Run the monitor in interactive mode:
+Run the monitor in interactive mode (recommended for initial setup and monitoring):
 
 ```bash
 sudo python3 network_anomaly_monitor.py
@@ -39,34 +42,36 @@ sudo python3 network_anomaly_monitor.py
 
 The script will:
 
-* Capture live packets.
-* Analyze traffic patterns.
-* Detect anomalies based on statistical thresholds.
-* Log alerts for suspicious or unusual network behavior.
+* Display available network interfaces and prompt for selection
+* Capture live packets on the selected interface
+* Analyze traffic patterns in real-time
+* Detect anomalies based on statistical thresholds
+* Log alerts for suspicious or unusual network behavior
+* Print periodic statistics every 30 seconds
 
-### Unattended Operation Mode Options
+### Unattended Operation Mode
 
-The script supports various unattended operation options for automated monitoring:
+For automated, background monitoring without user interaction:
 
 #### Suppress Console Output
 Run without printing statistics or status messages:
 
 ```bash
-sudo python3 network_anomaly_monitor.py --quiet
+sudo python3 network_anomaly_monitor.py --quiet --interface eth0
 ```
 
 #### Disable File Logging
 Prevent creation of log files:
 
 ```bash
-sudo python3 network_anomaly_monitor.py --no-log
+sudo python3 network_anomaly_monitor.py --no-log --interface eth0
 ```
 
 #### Custom Log File Location
 Specify a different log file path:
 
 ```bash
-sudo python3 network_anomaly_monitor.py --log-file /path/to/custom.log
+sudo python3 network_anomaly_monitor.py --log-file /var/log/network_monitor.log --interface eth0
 ```
 
 #### Daemon Mode
