@@ -137,4 +137,4 @@ When not in quiet mode, the script displays:
 
 ## License
 
-This project is licensed under the **GNU Affero General Public License (AGPL)**. See the `LICENSE` file for details.
+This project is licensed under the **GNU General Public License v3 (GPLv3)**. See the `LICENSE` file for details.
